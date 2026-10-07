@@ -43,6 +43,13 @@ registered by EPP plugins, including the embedded KV-cache collectors. Metric au
 configurable via `--metrics-endpoint-auth` (default `true`). TLS is a separate setting, configurable
 via `--metrics-cert-dir`; mutual TLS additionally requires `--metrics-client-ca-file`.
 
+With authentication enabled, the EPP validates each scrape with a TokenReview and a
+SubjectAccessReview. The Helm charts grant the EPP ServiceAccount `create` on both resources through
+a ClusterRole when `router.monitoring.prometheus.auth.enabled` is `true`. A scraper must send a
+bearer token for an identity that is allowed `get` on the `/metrics` non-resource URL. Setting
+`router.monitoring.prometheus.auth.enabled` to `false` serves `/metrics` without authentication and
+renders no cluster-scoped RBAC.
+
 ### Model server / engine
 
 The `metrics-data-source` plugin sends an HTTP or HTTPS request (`scheme`, default `http`; TLS

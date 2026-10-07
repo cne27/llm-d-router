@@ -183,6 +183,8 @@ monitoring:
     auth:
       # Set to false to allow unauthenticated /metrics access. Required for annotation-based
       # Prometheus scraping and Istio metrics-merging, which do not send Bearer tokens.
+      # When true, the chart creates a ClusterRole and ClusterRoleBinding that let the EPP
+      # create TokenReviews and SubjectAccessReviews to authenticate and authorize scrapes.
       enabled: true
       # Service account token secret for authentication
       secretName: inference-gateway-sa-metrics-reader-secret
