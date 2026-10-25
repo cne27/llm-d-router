@@ -1,3 +1,4 @@
+import argparse
 from contextlib import ExitStack
 import copy
 import json
@@ -486,6 +487,19 @@ class ProvenanceParsingTests(unittest.TestCase):
         self.assertEqual(perf.parse_container_image_ids(""), {})
 
 
+class IdleSampleTests(unittest.TestCase):
+    def test_container_missing_from_the_first_sample_is_kept(self):
+        samples = [
+            {"envoy-proxy": {"cpu": 10, "mem": 20}},
+            {"envoy-proxy": {"cpu": 30, "mem": 20}, "epp": {"cpu": 100, "mem": 40}},
+            {"envoy-proxy": {"cpu": 20, "mem": 20}, "epp": {"cpu": 200, "mem": 60}},
+        ]
+        self.assertEqual(
+            perf.average_idle_samples(samples),
+            {"envoy-proxy": {"cpu": 20, "mem": 20}, "epp": {"cpu": 150, "mem": 50}},
+        )
+
+
 class RunRecordTests(OfflineTestCase):
     def record(self, **overrides):
         values = dict(
@@ -493,7 +507,7 @@ class RunRecordTests(OfflineTestCase):
             started_at="2026-10-19T09:00:00Z",
             ns="llm-d-perf-1",
             status="SUCCESS",
-            setup={"router_config": "test/perf/config/router.yaml", "sim_replicas": 10},
+            target={"id": "optimized-baseline-job1", "digest": "d1", "setup": {"sim_replicas": 10}},
             epp_commit="abc123",
             images=["epp:main"],
             image_ids={"epp": "epp@sha256:aaa"},
@@ -507,6 +521,7 @@ class RunRecordTests(OfflineTestCase):
     def test_record_contents(self):
         record = self.record()
         self.assertEqual(record["schema_version"], perf.RUN_RECORD_SCHEMA_VERSION)
+        self.assertEqual(record["target"]["digest"], "d1")
         self.assertEqual(record["provenance"]["epp_commit"], "abc123")
         self.assertEqual(record["provenance"]["image_ids"], {"epp": "epp@sha256:aaa"})
         self.assertEqual(
@@ -529,6 +544,88 @@ class RunRecordTests(OfflineTestCase):
         inside = os.path.join(repo, "test", "perf", "job.yaml")
         self.assertEqual(perf.repo_relative_path(inside, repo), os.path.join("test", "perf", "job.yaml"))
         self.assertEqual(perf.repo_relative_path("/elsewhere/job.yaml", repo), "/elsewhere/job.yaml")
+
+
+class TargetTests(OfflineTestCase):
+    def write(self, relative, content):
+        path = self.directory / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        return str(path)
+
+    def repo_with_target(self, trend="metrics: []", epp_cpu="'2'", epp_memory="4Gi"):
+        for name in ("router.yaml", "job.yaml", "sim.yaml", "svc.yaml"):
+            self.write(f"config/{name}", f"{name} contents\n")
+        return self.write(
+            "targets/bench.yaml",
+            "setup:\n"
+            "  router_config: config/router.yaml\n"
+            "  perf_job: config/job.yaml\n"
+            "  sim_deploy: config/sim.yaml\n"
+            "  sim_svc: config/svc.yaml\n"
+            "  sim_replicas: 3\n"
+            "  epp_replicas: 1\n"
+            f"  epp_cpu: {epp_cpu}\n"
+            f"  epp_memory: {epp_memory}\n"
+            "  router_machine_family: c3\n"
+            "  epp_log_verbosity: 2\n"
+            f"trend: {{{trend}}}\n",
+        )
+
+    def target_for(self, target_path):
+        args = argparse.Namespace()
+        perf.apply_target(args, target_path, str(self.directory))
+        return perf.build_target(args, str(self.directory))
+
+    def test_nightly_target_matches_the_workflow_flags(self):
+        repo = Path(perf.__file__).resolve().parents[2]
+        args = argparse.Namespace()
+        perf.apply_target(args, str(repo / "test/perf/config/targets/optimized-baseline-job1.yaml"), str(repo))
+        self.assertEqual(args.test_name, "optimized-baseline-job1")
+        self.assertEqual(args.router_config, str(repo / "test/perf/config/router-configs/optimized-baseline.yaml"))
+        self.assertEqual(args.perf_job, str(repo / "test/perf/config/shared_prefix_job1.yaml"))
+        self.assertEqual((args.sim_replicas, args.epp_replicas, args.router_machine_family), (10, 1, "e2"))
+        self.assertEqual(args.epp_log_verbosity, perf.EPP_LOG_VERBOSITY)
+
+    def test_target_setup_is_repository_relative(self):
+        target = self.target_for(self.repo_with_target())
+        self.assertEqual(target["id"], "bench")
+        self.assertEqual(target["setup"]["perf_job"], os.path.join("config", "job.yaml"))
+        self.assertEqual(target["setup"]["router_machine_family"], "c3")
+
+    def test_unknown_setup_key_or_section_is_rejected(self):
+        for content in ("setup:\n  sim_replica: 3\n", "setups:\n  sim_replicas: 3\n"):
+            with self.subTest(content=content):
+                target = self.write("targets/bad.yaml", content)
+                with self.assertRaises(ValueError):
+                    perf.load_target(target)
+
+    def test_unquoted_resources_are_read_as_flag_strings(self):
+        quoted = self.target_for(self.repo_with_target(epp_cpu="'2'", epp_memory="'4096'"))
+        args = argparse.Namespace()
+        target = self.repo_with_target(epp_cpu="2", epp_memory="4096")
+        perf.apply_target(args, target, str(self.directory))
+        self.assertEqual((args.epp_cpu, args.epp_memory), ("2", "4096"))
+        self.assertEqual((perf.double_cpu(args.epp_cpu), perf.double_memory(args.epp_memory)), ("4", "8192"))
+        self.assertEqual(self.target_for(target)["digest"], quoted["digest"])
+
+    def test_setup_values_of_the_wrong_type_are_rejected(self):
+        for key, value in (("sim_replicas", "ten"), ("sim_replicas", 2.5), ("epp_cpu", "true"), ("router_config", "[a, b]")):
+            with self.subTest(key=key, value=value):
+                target = self.write("targets/bad.yaml", f"setup:\n  {key}: {value}\n")
+                with self.assertRaises(ValueError):
+                    perf.load_target(target)
+
+    def test_digest_changes_when_a_referenced_file_is_edited_in_place(self):
+        target = self.repo_with_target()
+        before = self.target_for(target)["digest"]
+        self.write("config/job.yaml", "edited stages\n")
+        self.assertNotEqual(self.target_for(target)["digest"], before)
+
+    def test_digest_ignores_the_trend_section(self):
+        first = self.target_for(self.repo_with_target("metrics: []"))["digest"]
+        second = self.target_for(self.repo_with_target("window_days: 14"))["digest"]
+        self.assertEqual(first, second)
 
 
 class MarkdownReportTests(OfflineTestCase):
@@ -603,6 +700,7 @@ class MarkdownReportTests(OfflineTestCase):
 
 class MainWiringTests(OfflineTestCase):
     def test_main_passes_scheduler_p99_to_report(self):
+        mocks = {}
         for name in (
             "create_namespace",
             "setup_hf_secret",
@@ -612,7 +710,7 @@ class MainWiringTests(OfflineTestCase):
             "run_benchmark",
             "cleanup_namespace",
         ):
-            self.contexts.enter_context(mock.patch.object(perf, name))
+            mocks[name] = self.contexts.enter_context(mock.patch.object(perf, name))
         self.contexts.enter_context(mock.patch.object(perf, "Thread"))
         self.contexts.enter_context(mock.patch.object(perf.time, "sleep"))
         self.contexts.enter_context(
@@ -649,11 +747,15 @@ class MainWiringTests(OfflineTestCase):
                     "offline-project",
                     "--results-dir",
                     str(self.directory),
+                    "--target",
+                    str(Path(perf.__file__).resolve().parent / "config" / "targets" / "optimized-baseline-job1.yaml"),
                 ],
             )
         )
         self.contexts.enter_context(mock.patch.object(perf, "stop_monitoring", False))
         perf.main()
+        deploy = mocks["deploy_epp"].call_args.kwargs
+        self.assertEqual((deploy["log_verbosity"], deploy["machine_family"]), (perf.EPP_LOG_VERBOSITY, "e2"))
         writer.assert_called_once()
         self.assertAlmostEqual(writer.call_args.args[13], 91.0)
         self.assertEqual(writer.call_args.args[14], "SUCCESS")
@@ -663,9 +765,11 @@ class MainWiringTests(OfflineTestCase):
         self.assertEqual(record["status"], "SUCCESS")
         self.assertEqual(record["provenance"]["image_ids"], {"epp": "epp@sha256:aaa"})
         self.assertAlmostEqual(record["scheduler_latency_ms"]["p99"], 91.0)
-        self.assertEqual(record["setup"]["epp_log_verbosity"], perf.EPP_LOG_VERBOSITY)
+        self.assertEqual(record["target"]["id"], "optimized-baseline-job1")
+        self.assertEqual(len(record["target"]["digest"]), 64)
+        self.assertEqual(record["target"]["setup"]["epp_log_verbosity"], perf.EPP_LOG_VERBOSITY)
         self.assertEqual(
-            record["setup"]["router_config"],
+            record["target"]["setup"]["router_config"],
             os.path.join("test", "perf", "config", "router-configs", "optimized-baseline.yaml"),
         )
 

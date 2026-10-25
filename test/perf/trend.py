@@ -8,36 +8,57 @@ import sys
 from collections import namedtuple
 from datetime import datetime, timedelta
 
-from run_nightly_perf import RUN_RECORD_SCHEMA_VERSION
+from run_nightly_perf import RUN_RECORD_SCHEMA_VERSION, load_target, target_id
 
-THRESHOLD = 0.10
-WINDOW_DAYS = 7
-MIN_BASELINE_RUNS = 4
+DEFAULT_THRESHOLD = 0.10
+DEFAULT_WINDOW_DAYS = 7
+DEFAULT_MIN_BASELINE_RUNS = 4
 DEFAULT_REPOSITORY = "llm-d/llm-d-router"
-COMPARABLE_SETUP_KEYS = ("router_config", "perf_job", "sim_replicas")
+DIRECTIONS = ("lower", "higher")
+TREND_KEYS = ("window_days", "min_baseline_runs", "metrics")
+METRIC_KEYS = ("name", "path", "direction", "threshold", "alerts")
 
-# Each metric has its own threshold so noisier measurements can be given more room.
-Metric = namedtuple("Metric", ["key", "label", "path", "alerts", "threshold"], defaults=[THRESHOLD])
-
-
-def container_metrics(container, alerts):
-    return [
-        Metric(f"{container}.idle_cpu_m", f"{container} idle CPU (m)", ("containers", container, "idle_cpu_m"), alerts),
-        Metric(f"{container}.peak_cpu_m", f"{container} peak CPU (m)", ("containers", container, "peak_cpu_m"), alerts),
-        Metric(f"{container}.idle_mem_mib", f"{container} idle memory (MiB)", ("containers", container, "idle_mem_mib"), alerts),
-        Metric(f"{container}.peak_mem_mib", f"{container} peak memory (MiB)", ("containers", container, "peak_mem_mib"), alerts),
-    ]
+Metric = namedtuple("Metric", ["name", "path", "direction", "threshold", "alerts"])
+TrendConfig = namedtuple("TrendConfig", ["target_id", "window_days", "min_baseline_runs", "metrics"])
 
 
-def scheduler_metrics():
-    return [
-        Metric(f"scheduler.{name}", f"scheduler {name} latency (ms)", ("scheduler_latency_ms", name), True)
-        for name in ("p50", "p95", "p99", "mean")
-    ]
+def check_keys(where, entry, allowed):
+    # A misspelled key would otherwise fall back to its default without notice.
+    unknown = set(entry) - set(allowed)
+    if unknown:
+        raise ValueError(f"{where}: unknown keys {sorted(unknown)}")
 
 
-# Lower is better for every metric. Only EPP metrics open issues; the other rows are reported.
-METRICS = container_metrics("epp", True) + scheduler_metrics() + container_metrics("envoy-proxy", False) + container_metrics("TOTAL", False)
+def parse_metric(entry):
+    where = f"metric {entry.get('name')!r}"
+    check_keys(where, entry, METRIC_KEYS)
+    direction = entry.get("direction", "lower")
+    if direction not in DIRECTIONS:
+        raise ValueError(f"{where}: direction must be one of {DIRECTIONS}, got {direction!r}")
+    alerts = entry.get("alerts", True)
+    if not isinstance(alerts, bool):
+        raise ValueError(f"{where}: alerts must be true or false, got {alerts!r}")
+    return Metric(
+        name=entry["name"],
+        path=tuple(entry["path"].split(".")),
+        direction=direction,
+        threshold=float(entry.get("threshold", DEFAULT_THRESHOLD)),
+        alerts=alerts,
+    )
+
+
+def load_trend_config(target_path):
+    trend = load_target(target_path).get("trend") or {}
+    check_keys(f"{target_path}: trend", trend, TREND_KEYS)
+    metrics = [parse_metric(entry) for entry in trend.get("metrics") or []]
+    if not metrics:
+        raise ValueError(f"{target_path}: trend.metrics is empty")
+    return TrendConfig(
+        target_id=target_id(target_path),
+        window_days=int(trend.get("window_days", DEFAULT_WINDOW_DAYS)),
+        min_baseline_runs=int(trend.get("min_baseline_runs", DEFAULT_MIN_BASELINE_RUNS)),
+        metrics=metrics,
+    )
 
 
 def issue_marker(test_name):
@@ -55,26 +76,30 @@ def load_records(results_dir, test_name):
     records = []
     for name in os.listdir(runs_dir):
         if name.endswith(".json"):
-            records.append(load_record(os.path.join(runs_dir, name)))
+            record = load_record(os.path.join(runs_dir, name))
+            if record is not None:
+                records.append(record)
     return sorted(records, key=lambda record: parse_time(record["started_at"]))
 
 
 def load_record(path):
     with open(path) as f:
         record = json.load(f)
+    # A record written by another schema version cannot be compared, so it is skipped rather than failing the check.
     if record.get("schema_version") != RUN_RECORD_SCHEMA_VERSION:
-        raise ValueError(f"{path}: unsupported run record schema_version {record.get('schema_version')!r}")
-    for key in ("started_at", "status", "setup"):
+        print(f"Skipping {path}: run record schema_version {record.get('schema_version')!r}, expected {RUN_RECORD_SCHEMA_VERSION}")
+        return None
+    for key in ("started_at", "status", "target"):
         if key not in record:
             raise ValueError(f"{path}: run record is missing {key!r}")
     return record
 
 
 def comparable(first, second):
-    return all(first["setup"].get(key) == second["setup"].get(key) for key in COMPARABLE_SETUP_KEYS)
+    return all(first["target"].get(key) == second["target"].get(key) for key in ("id", "digest"))
 
 
-def select_baseline(records, tonight, window_days=WINDOW_DAYS):
+def select_baseline(records, tonight, window_days):
     end = parse_time(tonight["started_at"])
     start = end - timedelta(days=window_days)
     return [
@@ -99,11 +124,18 @@ def metric_value(record, metric):
     return float(value)
 
 
+def is_over(metric, tonight, baseline, values):
+    # Beyond every baseline run as well as past the threshold, so a metric with a wide normal range does not fire on ordinary noise.
+    if metric.direction == "lower":
+        return (tonight - baseline) / baseline > metric.threshold and tonight > max(values)
+    return (baseline - tonight) / baseline > metric.threshold and tonight < min(values)
+
+
 def compare_metric(metric, baseline_records, candidate, min_runs):
-    result = {"key": metric.key, "label": metric.label, "alerts": metric.alerts, "threshold": metric.threshold, "over": False}
+    result = {"name": metric.name, "direction": metric.direction, "alerts": metric.alerts, "threshold": metric.threshold, "over": False}
     tonight = metric_value(candidate, metric)
     values = [value for value in (metric_value(record, metric) for record in baseline_records) if value is not None]
-    result.update(tonight=tonight, runs=len(values), baseline=None, delta=None, min=None, max=None)
+    result.update(tonight=tonight, previous=None, runs=len(values), baseline=None, delta=None, min=None, max=None)
     if tonight is None:
         result["verdict"] = "no data"
         return result
@@ -111,10 +143,8 @@ def compare_metric(metric, baseline_records, candidate, min_runs):
         result["verdict"] = "insufficient baseline"
         return result
     baseline = statistics.median(values)
-    delta = (tonight - baseline) / baseline
-    # Exceeding every baseline run keeps a metric with a wide normal range from firing on ordinary noise.
-    over = delta > metric.threshold and tonight > max(values)
-    result.update(baseline=baseline, delta=delta, min=min(values), max=max(values), over=over)
+    over = is_over(metric, tonight, baseline, values)
+    result.update(baseline=baseline, delta=(tonight - baseline) / baseline, min=min(values), max=max(values), over=over)
     if not over:
         result["verdict"] = "within threshold"
     elif metric.alerts:
@@ -124,8 +154,8 @@ def compare_metric(metric, baseline_records, candidate, min_runs):
     return result
 
 
-def compare(baseline_records, candidate, min_runs=MIN_BASELINE_RUNS):
-    return [compare_metric(metric, baseline_records, candidate, min_runs) for metric in METRICS]
+def compare(baseline_records, candidate, metrics, min_runs):
+    return [compare_metric(metric, baseline_records, candidate, min_runs) for metric in metrics]
 
 
 def previous_run(records, run):
@@ -139,19 +169,21 @@ def previous_run(records, run):
     return earlier[-1] if earlier else None
 
 
-def confirm_regressions(results, previous_over):
+def apply_previous_run(results, previous_results):
     # A metric regresses only when the previous comparable run was over its threshold too.
+    previous = {result["name"]: result for result in previous_results}
     for result in results:
+        result["previous"] = previous[result["name"]]["tonight"]
         if result["verdict"] == "over threshold":
-            result["verdict"] = "regressed" if result["key"] in previous_over else "over threshold, first run"
+            result["verdict"] = "regressed" if previous[result["name"]]["over"] else "over threshold, first run"
 
 
 def commit_of(record):
     return record.get("provenance", {}).get("epp_commit") or None
 
 
-def evaluate(records, test_name, window_days=WINDOW_DAYS, min_runs=MIN_BASELINE_RUNS):
-    verdict = {"test_name": test_name, "window_days": window_days, "min_baseline_runs": min_runs, "metrics": []}
+def evaluate(records, config):
+    verdict = {"test_name": config.target_id, "window_days": config.window_days, "min_baseline_runs": config.min_baseline_runs, "metrics": []}
     if not records:
         verdict["status"] = "no_runs"
         return verdict
@@ -162,15 +194,14 @@ def evaluate(records, test_name, window_days=WINDOW_DAYS, min_runs=MIN_BASELINE_
         return verdict
     previous = previous_run(records, tonight)
     # Tonight and the previous run share one baseline from before the previous run, so a lasting step counts on both.
-    baseline = select_baseline(records, previous, window_days) if previous else []
+    baseline = select_baseline(records, previous, config.window_days) if previous else []
     verdict["baseline_runs"] = [record["started_at"] for record in baseline]
     verdict["range_base_commit"] = commit_of(baseline[-1]) if baseline else None
-    if len(baseline) < min_runs:
+    if len(baseline) < config.min_baseline_runs:
         verdict["status"] = "insufficient_baseline"
         return verdict
-    verdict["metrics"] = compare(baseline, tonight, min_runs)
-    previous_over = {result["key"] for result in compare(baseline, previous, min_runs) if result["over"]}
-    confirm_regressions(verdict["metrics"], previous_over)
+    verdict["metrics"] = compare(baseline, tonight, config.metrics, config.min_baseline_runs)
+    apply_previous_run(verdict["metrics"], compare(baseline, previous, config.metrics, config.min_baseline_runs))
     regressed = any(result["verdict"] == "regressed" for result in verdict["metrics"])
     verdict["status"] = "regressed" if regressed else "ok"
     return verdict
@@ -186,29 +217,31 @@ def format_delta(value):
 
 def metrics_table(results):
     lines = [
-        "| Metric | Tonight | Baseline (median) | Delta | Threshold | Baseline range | Runs | Verdict |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Metric | Tonight | Previous run | Baseline (median) | Delta | Threshold | Baseline range | Runs | Verdict |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for result in results:
         spread = "-" if result["min"] is None else f"{result['min']:.2f}-{result['max']:.2f}"
+        threshold = f"{result['threshold'] * 100:.0f}% {result['direction']} is better"
         lines.append(
-            f"| {result['label']} | {format_number(result['tonight'])} | {format_number(result['baseline'])} | "
-            f"{format_delta(result['delta'])} | {result['threshold'] * 100:.0f}% | {spread} | {result['runs']} | {result['verdict']} |"
+            f"| {result['name']} | {format_number(result['tonight'])} | {format_number(result['previous'])} | {format_number(result['baseline'])} | "
+            f"{format_delta(result['delta'])} | {threshold} | {spread} | {result['runs']} | {result['verdict']} |"
         )
     return "\n".join(lines)
 
 
 RULE_TEXT = (
-    "A metric regresses when tonight's run and the previous comparable run are both more than its threshold over the "
-    "median of the successful runs from the {window_days} days before the previous run, and above every one of them."
+    "A metric regresses when tonight's run and the previous comparable run are both worse than the median of the "
+    "successful runs from the {window_days} days before the previous run by more than its threshold, and worse than "
+    "every one of them. Runs are comparable when they share the benchmark target and its config digest."
 )
 
 STATUS_TEXT = {
     "no_runs": "No run records found.",
     "run_failed": "Tonight's run did not succeed, so nothing was compared.",
     "insufficient_baseline": "Fewer than {min_baseline_runs} comparable successful runs in the {window_days} days before the previous run, so nothing was compared.",
-    "ok": "No EPP metric regressed.",
-    "regressed": "At least one EPP metric regressed.",
+    "ok": "No alerting metric regressed.",
+    "regressed": "At least one alerting metric regressed.",
 }
 
 
@@ -244,7 +277,7 @@ def render_issue_body(verdict, repository, run_url=None):
     regressed = [result for result in verdict["metrics"] if result["verdict"] == "regressed"]
     lines = [
         issue_marker(verdict["test_name"]),
-        f"The nightly perf run on {verdict['tonight']['started_at']} confirmed a regression in these EPP metrics. "
+        f"The nightly perf run on {verdict['tonight']['started_at']} confirmed a regression in these metrics. "
         + rule_line(verdict),
         "",
         metrics_table(regressed),
@@ -279,9 +312,9 @@ def write_outputs(verdict, output_dir, repository, run_url):
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Compare the newest nightly perf run with its trailing median")
-    parser.add_argument("--results-dir", required=True, help="Results folder containing runs/<test-name>/*.json")
-    parser.add_argument("--test-name", required=True, help="Name of the performance test")
+    parser = argparse.ArgumentParser(description="Compare the newest nightly perf run of a benchmark target with its trailing median")
+    parser.add_argument("--results-dir", required=True, help="Results folder containing runs/<target-id>/*.json")
+    parser.add_argument("--target", required=True, help="Benchmark target manifest; its trend section sets the compared metrics")
     parser.add_argument("--output-dir", required=True, help="Folder for trend-summary.md, trend-verdict.json and trend-issue.md")
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPOSITORY), help="owner/name used for compare links")
     parser.add_argument("--run-url", default=None, help="Workflow run URL to link from the issue")
@@ -291,8 +324,9 @@ def parse_args(argv):
 def main(argv=None):
     # A regression exits 0; an error in this script propagates and fails the step.
     args = parse_args(argv)
-    records = load_records(args.results_dir, args.test_name)
-    verdict = evaluate(records, args.test_name)
+    config = load_trend_config(args.target)
+    records = load_records(args.results_dir, config.target_id)
+    verdict = evaluate(records, config)
     print(write_outputs(verdict, args.output_dir, args.repository, args.run_url))
     return 0
 

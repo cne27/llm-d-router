@@ -6,6 +6,7 @@ This directory contains the performance testing pipeline for the Endpoint Picker
 
 - **`config/`**: Configuration manifests for test runs.
   - **`router-configs/`**: Router Helm configuration values recipes (e.g. `optimized-baseline.yaml`).
+  - **`targets/`**: Benchmark target manifests. Each defines the benchmark setup and the trend check settings for one test.
   - **`studyanalysis/`**: Detailed analysis reports covering prefix-caching scaling performance, ITL streaming duration impact, input/output token scaling, and high QPS comparisons.
   - `llm-d-sim-deployment.yaml` / `llm-d-sim-service.yaml`: Kubernetes manifests for deploying the vLLM simulator.
   - `shared_prefix_job1.yaml`: Performance test workload specification defining load stages, API target, and request distributions.
@@ -32,16 +33,13 @@ Run the orchestrator script from the repository root:
 
 ```bash
 python3 test/perf/run_nightly_perf.py \
-    --router-config test/perf/config/router-configs/optimized-baseline.yaml \
-    --test-name optimized-baseline-job1 \
-    --perf-job test/perf/config/shared_prefix_job1.yaml \
-    --sim-replicas 10 \
+    --target test/perf/config/targets/optimized-baseline-job1.yaml \
     --gcp-project <your-gcp-project-id> \
-    --results-dir test/perf/results/optimized-baseline \
-    --router-machine-family e2
+    --results-dir test/perf/results/optimized-baseline
 ```
 
 ### Parameters
+- `--target`: Benchmark target manifest under `config/targets/`. Its `setup` section sets the router config, perf job, simulator manifests and replicas, EPP replicas, CPU, memory and log verbosity, and machine family, overriding the matching flags below. The manifest's file name is the test name.
 - `--router-config`: Path to the consolidated Helm values file for the EPP.
 - `--test-name`: Unique name for this test run (defines the markdown filename).
 - `--perf-job`: Path to the `inference-perf` job file config.
@@ -49,6 +47,7 @@ python3 test/perf/run_nightly_perf.py \
 - `--gcp-project`: GCP Project ID hosting your GKE cluster.
 - `--results-dir`: Output path for appending markdown result metrics.
 - `--router-machine-family`: Optional node affinity mapping (e.g. `e2`, `c3`).
+- `--epp-log-verbosity`: EPP log verbosity passed as `-v` (default 4).
 - `--collect-pprof-profiles`: (Optional) Collect EPP CPU & memory pprof profiles and render them as PNG and SVG visual artifacts.
 - `--gcs-bucket`: (Optional) Target GCS bucket name or URI (e.g. `gs://llm-d-perf-results`) to sync and preserve test results and profiling artifacts without committing them to the Git repository.
 - `--no-cleanup`: (Optional) Skip namespace deletion on test completion (useful for debugging).
@@ -96,46 +95,51 @@ they do not replace this gateway-to-model comparison.
 
 Next to each markdown row, the runner writes a JSON record to
 `<results-dir>/runs/<test-name>/<UTC start time>.json`. The record holds the
-run status, the setup (router config and perf job paths relative to the
-repository root, simulator and EPP replica counts, machine family, EPP log
-verbosity), the EPP commit from the `llm_d_epp_info` metric, the container
-image digests, every container's idle and peak CPU and memory, and the
+run status; the target: its ID, its setup with file paths relative to the
+repository root, and a digest of that setup and of the contents of the files
+it references; the EPP commit from the `llm_d_epp_info` metric; the container
+image digests; every container's idle and peak CPU and memory; and the
 scheduler latency percentiles and mean. Records are written under the same
 condition as the markdown row and sync to GCS with the rest of the results
 folder.
 
 ### Trend check
 
-`trend.py` compares the newest run record of a test, and the previous
-successful run with the same router config, perf job and simulator replica
-count, with the comparable successful runs from the 7 days before that
-previous run. An EPP metric regresses when both runs are more than its
-threshold over the baseline median and above every baseline run (lower is
-better for CPU, memory and latency). Every metric's threshold is 10% and is
-set per metric in `METRICS` in `trend.py`. With fewer than 4 baseline runs,
-nothing is compared. Envoy and `TOTAL` rows are compared and reported but
-never count as a regression.
+`trend.py` compares the newest run record of a target, and the previous
+successful run of the same target, with the successful runs from the window
+before that previous run. Runs are comparable only when their target ID and
+digest match, so editing the target or any file it references starts a new
+baseline. A metric regresses when both runs are worse than the baseline median
+by more than its threshold and worse than every baseline run. With fewer than
+the minimum number of baseline runs, nothing is compared.
+
+The target's `trend` section sets the window (7 days), the minimum baseline
+runs (4) and the compared metrics. Each metric has a name, a dotted path into
+the run record, a direction (`lower` or `higher` is better), a threshold, and
+whether it opens issues (`alerts`) or is only reported. Unknown keys in either
+section are rejected. The `trend` section is not part of the digest, so tuning
+it keeps the baseline.
 
 ```bash
 python3 test/perf/trend.py \
     --results-dir test/perf/results/optimized-baseline \
-    --test-name optimized-baseline-job1 \
+    --target test/perf/config/targets/optimized-baseline-job1.yaml \
     --output-dir trend-output
 ```
 
 It writes `trend-summary.md` and `trend-verdict.json` to the output folder, and
 `trend-issue.md` when a metric regressed. When `GITHUB_STEP_SUMMARY` is set, the
-summary is appended to it. A regression exits 0; an unreadable or malformed run
-record exits non-zero.
+summary is appended to it. A regression exits 0. A run record from another
+schema version is skipped; an unreadable or malformed record of the current
+version exits non-zero.
 
 What to expect from the rule:
 
 - A regression opens or updates the issue on its second run. The first run is
   shown as over threshold in the summary.
 - A single bad run does not open an issue.
-- A lasting regression is reported once. From its third run on, its first run
-  is in the baseline, so a regression that stays at the same level is no
-  longer above every baseline run.
+- A lasting regression is usually reported once. It is reported again only
+  when two runs in a row are worse than every run in the week before them.
 - Run records start with the first run that writes them, so the first
   comparison happens after 5 comparable successful runs: 4 for the baseline
   and the previous run.
@@ -162,5 +166,6 @@ The benchmarking pipeline runs daily via GHA:
 - **Schedule**: Daily at 09:00 UTC.
 - **Actions**:
   1. Authenticates to GCP and configures `kubectl` to point to the GKE development cluster.
-  2. Runs `run_nightly_perf.py` (specifying `--router-machine-family e2` and `--gcs-bucket`).
-  3. Appends the metrics results and uploads profiling artifacts directly to the specified Google Cloud Storage bucket.
+  2. Checks out `inference-perf` at the commit pinned in the workflow.
+  3. Runs `run_nightly_perf.py` with the `optimized-baseline-job1` target and `--gcs-bucket`.
+  4. Appends the metrics results and uploads profiling artifacts directly to the specified Google Cloud Storage bucket.
