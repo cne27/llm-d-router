@@ -233,7 +233,8 @@ def metrics_table(results):
 RULE_TEXT = (
     "A metric regresses when tonight's run and the previous comparable run are both worse than the median of the "
     "successful runs from the {window_days} days before the previous run by more than its threshold, and worse than "
-    "every one of them. Runs are comparable when they share the benchmark target and its config digest."
+    "every one of them. Runs are comparable when they share the benchmark target and the digest of its setup, "
+    "workload and simulator files. Router config edits keep the baseline."
 )
 
 STATUS_TEXT = {

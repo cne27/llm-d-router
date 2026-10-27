@@ -111,9 +111,10 @@ successful run of the same target, with the successful runs from the window
 before that previous run. Runs are comparable only when their target ID and
 digest match, so editing the target or the workload or simulator files starts a
 new baseline. Editing the router config keeps the baseline, so a config change
-that slows the EPP is compared against the runs before it. A metric regresses when both runs are worse than the baseline median
-by more than its threshold and worse than every baseline run. With fewer than
-the minimum number of baseline runs, nothing is compared.
+that slows the EPP is compared against the runs before it. A metric regresses
+when both runs are worse than the baseline median by more than its threshold
+and worse than every baseline run. With fewer than the minimum number of
+baseline runs, nothing is compared.
 
 The target's `trend` section sets the window (7 days), the minimum baseline
 runs (4) and the compared metrics. Each metric has a name, a dotted path into

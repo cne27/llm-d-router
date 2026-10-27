@@ -33,8 +33,7 @@ TARGET_SETUP_TYPES = {
     "epp_log_verbosity": int,
 }
 TARGET_FILE_KEYS = ("router_config", "perf_job", "sim_deploy", "sim_svc")
-# The router config's contents stay out of the digest so that an edit to it is compared against the runs before it.
-DIGEST_FILE_KEYS = ("perf_job", "sim_deploy", "sim_svc")
+DIGEST_FILE_KEYS = tuple(key for key in TARGET_FILE_KEYS if key != "router_config")
 TARGET_SECTIONS = ("setup", "trend")
 
 def run_cmd(cmd, check=True, capture_output=True, text=True):
