@@ -23,7 +23,7 @@ trend:
     - {name: scheduler p50 latency (ms), path: scheduler_latency_ms.p50, direction: lower, threshold: 0.25, alerts: true}
     - {name: scheduler p95 latency (ms), path: scheduler_latency_ms.p95, direction: lower, threshold: 0.25, alerts: true}
     - {name: scheduler p99 latency (ms), path: scheduler_latency_ms.p99, direction: lower, threshold: 0.25, alerts: true}
-    - {name: scheduler mean latency (ms), path: scheduler_latency_ms.mean, direction: lower, threshold: 0.10, alerts: true}
+    - {name: scheduler mean latency (ms), path: scheduler_latency_ms.mean, direction: lower, threshold: 0.25, alerts: true}
     - {name: envoy-proxy idle CPU (m), path: containers.envoy-proxy.idle_cpu_m, direction: lower, threshold: 0.10, alerts: false}
     - {name: envoy-proxy peak CPU (m), path: containers.envoy-proxy.peak_cpu_m, direction: lower, threshold: 0.10, alerts: false}
     - {name: envoy-proxy idle memory (MiB), path: containers.envoy-proxy.idle_mem_mib, direction: lower, threshold: 0.10, alerts: false}

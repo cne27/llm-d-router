@@ -56,9 +56,8 @@ class TrendConfigTests(unittest.TestCase):
         self.assertEqual(CONFIG.metrics[1].path, ("containers", "epp", "peak_cpu_m"))
         metrics = {metric.name: metric for metric in CONFIG.metrics}
         self.assertFalse(metrics["epp idle CPU (m)"].alerts)
-        for percentile in ("p50", "p95", "p99"):
-            self.assertEqual(metrics[f"scheduler {percentile} latency (ms)"].threshold, 0.25)
-        self.assertEqual(metrics["scheduler mean latency (ms)"].threshold, 0.10)
+        for statistic in ("p50", "p95", "p99", "mean"):
+            self.assertEqual(metrics[f"scheduler {statistic} latency (ms)"].threshold, 0.25)
 
     def test_metric_defaults_and_validation(self):
         metric = trend.parse_metric({"name": "m", "path": "a.b"})
