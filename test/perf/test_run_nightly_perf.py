@@ -622,6 +622,14 @@ class TargetTests(OfflineTestCase):
         self.write("config/job.yaml", "edited stages\n")
         self.assertNotEqual(self.target_for(target)["digest"], before)
 
+    def test_router_config_edit_keeps_the_digest_and_is_recorded(self):
+        target = self.repo_with_target()
+        before = self.target_for(target)
+        self.write("config/router.yaml", "edited scorer weights\n")
+        after = self.target_for(target)
+        self.assertEqual(after["digest"], before["digest"])
+        self.assertNotEqual(after["router_config_sha256"], before["router_config_sha256"])
+
     def test_digest_ignores_the_trend_section(self):
         first = self.target_for(self.repo_with_target("metrics: []"))["digest"]
         second = self.target_for(self.repo_with_target("window_days: 14"))["digest"]

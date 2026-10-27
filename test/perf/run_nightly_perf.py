@@ -33,6 +33,8 @@ TARGET_SETUP_TYPES = {
     "epp_log_verbosity": int,
 }
 TARGET_FILE_KEYS = ("router_config", "perf_job", "sim_deploy", "sim_svc")
+# The router config's contents stay out of the digest so that an edit to it is compared against the runs before it.
+DIGEST_FILE_KEYS = ("perf_job", "sim_deploy", "sim_svc")
 TARGET_SECTIONS = ("setup", "trend")
 
 def run_cmd(cmd, check=True, capture_output=True, text=True):
@@ -681,13 +683,18 @@ def file_sha256(path):
 
 def target_digest(setup, repo_root):
     # Hashing the referenced files catches edits made in place under an unchanged path.
-    files = {key: file_sha256(os.path.join(repo_root, setup[key])) for key in TARGET_FILE_KEYS}
+    files = {key: file_sha256(os.path.join(repo_root, setup[key])) for key in DIGEST_FILE_KEYS}
     canonical = json.dumps({"setup": setup, "files": files}, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 def build_target(args, repo_root):
     setup = target_setup(args, repo_root)
-    return {'id': args.test_name, 'digest': target_digest(setup, repo_root), 'setup': setup}
+    return {
+        'id': args.test_name,
+        'digest': target_digest(setup, repo_root),
+        'router_config_sha256': file_sha256(os.path.join(repo_root, setup['router_config'])),
+        'setup': setup,
+    }
 
 def build_run_record(test_name, started_at, ns, status, target, epp_commit, images, image_ids, idle_metrics, peak_metrics, latency):
     containers = {}

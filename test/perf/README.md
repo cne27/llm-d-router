@@ -96,8 +96,9 @@ they do not replace this gateway-to-model comparison.
 Next to each markdown row, the runner writes a JSON record to
 `<results-dir>/runs/<test-name>/<UTC start time>.json`. The record holds the
 run status; the target: its ID, its setup with file paths relative to the
-repository root, and a digest of that setup and of the contents of the files
-it references; the EPP commit from the `llm_d_epp_info` metric; the container
+repository root, a digest of that setup and of the contents of the files it
+references other than the router config, and the SHA-256 of the router config;
+the EPP commit from the `llm_d_epp_info` metric; the container
 image digests; every container's idle and peak CPU and memory; and the
 scheduler latency percentiles and mean. Records are written under the same
 condition as the markdown row and sync to GCS with the rest of the results
@@ -108,8 +109,9 @@ folder.
 `trend.py` compares the newest run record of a target, and the previous
 successful run of the same target, with the successful runs from the window
 before that previous run. Runs are comparable only when their target ID and
-digest match, so editing the target or any file it references starts a new
-baseline. A metric regresses when both runs are worse than the baseline median
+digest match, so editing the target or the workload or simulator files starts a
+new baseline. Editing the router config keeps the baseline, so a config change
+that slows the EPP is compared against the runs before it. A metric regresses when both runs are worse than the baseline median
 by more than its threshold and worse than every baseline run. With fewer than
 the minimum number of baseline runs, nothing is compared.
 
